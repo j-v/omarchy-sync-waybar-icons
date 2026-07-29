@@ -87,71 +87,87 @@ for desktop in "${APP_DIR}"/*.desktop; do
 done
 
 # === Phase 2: Create local overrides for system TUI apps ===
-# System TUI apps (installed via pacman) have .desktop files with Terminal=true.
-# When launched from Walker, the app runs inside a terminal and the window class
-# is the terminal's — so Waybar shows a terminal icon regardless of which TUI
-# app is running.
+# Auto-discover all system .desktop files with Terminal=true and create local
+# overrides that wrap the app with omarchy-launch-tui for a unique window class.
 #
-# To fix this, we create local .desktop overrides in ~/.local/share/applications/
-# that wrap the app with omarchy-launch-tui, giving it a unique window class.
+# Optional: Add app IDs to ~/.config/omarchy/tui-icons-ignore.list (one per
+# line, # comments) to exclude specific apps from wrapping.
+
+IGNORE_FILE="${HOME}/.config/omarchy/tui-icons-ignore.list"
+
+declare -A IGNORED_APPS
+if [ -f "$IGNORE_FILE" ]; then
+    while IFS= read -r line; do
+        line="${line%%#*}"
+        line="${line//[[:space:]]/}"
+        [ -n "$line" ] || continue
+        IGNORED_APPS["$line"]=1
+    done < "$IGNORE_FILE"
+fi
+
 system_dirs=("/usr/share/applications" "/usr/local/share/applications")
+declare -A DONE_APPS
 
-KNOWN_TUI_APPS=("micro" "cliamp" "btop" "nvim" "htop")
+for dir in "${system_dirs[@]}"; do
+    [ -d "$dir" ] || continue
+    for sys_desktop in "$dir"/*.desktop; do
+        [ -f "$sys_desktop" ] || continue
 
-for app_id in "${KNOWN_TUI_APPS[@]}"; do
-    command -v "$app_id" &>/dev/null || continue
+        app_id=$(basename "$sys_desktop" .desktop)
 
-    sys_desktop=""
-    for dir in "${system_dirs[@]}"; do
-        if [ -f "${dir}/${app_id}.desktop" ]; then
-            sys_desktop="${dir}/${app_id}.desktop"
-            break
+        [[ -v DONE_APPS["$app_id"] ]] && continue
+        DONE_APPS["$app_id"]=1
+
+        [[ -v IGNORED_APPS["$app_id"] ]] && continue
+
+        grep -q "^Terminal=true" "$sys_desktop" 2>/dev/null || continue
+
+        ORIG_EXEC=$(grep "^Exec=" "$sys_desktop" | head -1 | cut -d= -f2- || true)
+        [ -z "$ORIG_EXEC" ] && continue
+        ORIG_CMD=$(echo "$ORIG_EXEC" | awk '{print $1}')
+        CMD_BASE=$(basename "$ORIG_CMD")
+        command -v "$CMD_BASE" &>/dev/null || continue
+
+        local_desktop="${APP_DIR}/${app_id}.desktop"
+        if [ -f "$local_desktop" ]; then
+            grep -q "^X-Omarchy-TUI-Override=true" "$local_desktop" 2>/dev/null && continue
         fi
+
+        APP_NAME=$(grep "^Name=" "$sys_desktop" | head -1 | cut -d= -f2- || true)
+        APP_ICON=$(grep "^Icon=" "$sys_desktop" | head -1 | cut -d= -f2- || true)
+        APP_COMMENT=$(grep "^Comment=" "$sys_desktop" | head -1 | cut -d= -f2- || true)
+        APP_GENERICNAME=$(grep "^GenericName=" "$sys_desktop" | head -1 | cut -d= -f2- || true)
+        APP_CATEGORIES=$(grep "^Categories=" "$sys_desktop" | head -1 | cut -d= -f2- || true)
+        APP_KEYWORDS=$(grep "^Keywords=" "$sys_desktop" | head -1 | cut -d= -f2- || true)
+        APP_MIMETYPE=$(grep "^MimeType=" "$sys_desktop" | head -1 | cut -d= -f2- || true)
+
+        ORIG_ARGS=""
+        if echo "$ORIG_EXEC" | grep -q ' '; then
+            ORIG_ARGS=$(echo "$ORIG_EXEC" | cut -d' ' -f2-)
+        fi
+
+        NEW_CLASS="org.omarchy.${CMD_BASE}"
+
+        {
+            echo "[Desktop Entry]"
+            echo "Type=Application"
+            [ -n "$APP_NAME" ] && echo "Name=${APP_NAME}"
+            [ -n "$APP_GENERICNAME" ] && echo "GenericName=${APP_GENERICNAME}"
+            [ -n "$APP_COMMENT" ] && echo "Comment=${APP_COMMENT}"
+            echo "Exec=omarchy-launch-tui ${CMD_BASE}${ORIG_ARGS:+ ${ORIG_ARGS}}"
+            echo "Icon=${APP_ICON:-${CMD_BASE}}"
+            [ -n "$APP_CATEGORIES" ] && echo "Categories=${APP_CATEGORIES}"
+            [ -n "$APP_KEYWORDS" ] && echo "Keywords=${APP_KEYWORDS}"
+            [ -n "$APP_MIMETYPE" ] && echo "MimeType=${APP_MIMETYPE}"
+            echo "Terminal=false"
+            echo "StartupNotify=false"
+            echo "StartupWMClass=${NEW_CLASS}"
+            echo "X-Omarchy-TUI-Override=true"
+        } > "$local_desktop"
+
+        echo "  override ${app_id}.desktop -> class ${NEW_CLASS}"
+        overridden=$((overridden + 1))
     done
-    [ -z "$sys_desktop" ] && continue
-
-    grep -q "^Terminal=true" "$sys_desktop" || continue
-
-    local_desktop="${APP_DIR}/${app_id}.desktop"
-    if [ -f "$local_desktop" ]; then
-        grep -q "^X-Omarchy-TUI-Override=true" "$local_desktop" 2>/dev/null && continue
-    fi
-
-    APP_NAME=$(grep "^Name=" "$sys_desktop" | head -1 | cut -d= -f2- || true)
-    APP_ICON=$(grep "^Icon=" "$sys_desktop" | head -1 | cut -d= -f2- || true)
-    APP_COMMENT=$(grep "^Comment=" "$sys_desktop" | head -1 | cut -d= -f2- || true)
-    APP_GENERICNAME=$(grep "^GenericName=" "$sys_desktop" | head -1 | cut -d= -f2- || true)
-    APP_CATEGORIES=$(grep "^Categories=" "$sys_desktop" | head -1 | cut -d= -f2- || true)
-    APP_KEYWORDS=$(grep "^Keywords=" "$sys_desktop" | head -1 | cut -d= -f2- || true)
-    APP_MIMETYPE=$(grep "^MimeType=" "$sys_desktop" | head -1 | cut -d= -f2- || true)
-
-    ORIG_EXEC=$(grep "^Exec=" "$sys_desktop" | head -1 | cut -d= -f2- || true)
-    ORIG_ARGS=""
-    if echo "$ORIG_EXEC" | grep -q ' '; then
-        ORIG_ARGS=$(echo "$ORIG_EXEC" | cut -d' ' -f2-)
-    fi
-
-    NEW_CLASS="org.omarchy.${app_id}"
-
-    {
-        echo "[Desktop Entry]"
-        echo "Type=Application"
-        [ -n "$APP_NAME" ] && echo "Name=${APP_NAME}"
-        [ -n "$APP_GENERICNAME" ] && echo "GenericName=${APP_GENERICNAME}"
-        [ -n "$APP_COMMENT" ] && echo "Comment=${APP_COMMENT}"
-        echo "Exec=omarchy-launch-tui ${app_id}${ORIG_ARGS:+ ${ORIG_ARGS}}"
-        echo "Icon=${APP_ICON:-${app_id}}"
-        [ -n "$APP_CATEGORIES" ] && echo "Categories=${APP_CATEGORIES}"
-        [ -n "$APP_KEYWORDS" ] && echo "Keywords=${APP_KEYWORDS}"
-        [ -n "$APP_MIMETYPE" ] && echo "MimeType=${APP_MIMETYPE}"
-        echo "Terminal=false"
-        echo "StartupNotify=false"
-        echo "StartupWMClass=${NEW_CLASS}"
-        echo "X-Omarchy-TUI-Override=true"
-    } > "$local_desktop"
-
-    echo "  override ${app_id}.desktop -> class ${NEW_CLASS}"
-    overridden=$((overridden + 1))
 done
 
 # === Phase 3: Discover TUI apps and create shadow entries ===
@@ -168,13 +184,14 @@ record_entry() {
     printf '%s|%s|%s\n' "$class" "$icon" "$name" >> "$tmpfile"
 }
 
-# First, record entries for any overrides we just created (Phase 2)
-for app_id in "${KNOWN_TUI_APPS[@]}"; do
-    local_desktop="${APP_DIR}/${app_id}.desktop"
+# Record entries from local override files (created by Phase 2)
+for local_desktop in "${APP_DIR}"/*.desktop; do
     [ -f "$local_desktop" ] || continue
     grep -q "^X-Omarchy-TUI-Override=true" "$local_desktop" 2>/dev/null || continue
 
-    CLASS="org.omarchy.${app_id}"
+    CLASS=$(grep "^StartupWMClass=" "$local_desktop" | head -1 | cut -d= -f2-)
+    [ -z "$CLASS" ] && continue
+
     ICON=$(grep "^Icon=" "$local_desktop" | head -1 | cut -d= -f2-)
     APP_NAME=$(grep "^Name=" "$local_desktop" | head -1 | cut -d= -f2-)
     record_entry "$CLASS" "$ICON" "$APP_NAME"
