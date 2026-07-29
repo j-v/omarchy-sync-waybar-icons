@@ -18,41 +18,31 @@ Chromium-installed PWAs work correctly because Chromium creates a
 
 ## Solution
 
-This script scans running browser-app windows via `hyprctl clients`, decodes
-the URL from the window class, then:
+Two scripts:
 
-1. **If an omarchy-managed `.desktop` exists** for that URL (e.g.
-   `~/.local/share/applications/Discord.desktop`) → creates a **symlink**
-   from the Chrome class name to the existing entry (preserving the bundled
-   icon).
-2. **If no entry exists** (a site you opened manually with `--app=`) →
-   downloads the site's favicon and creates a new `.desktop` entry so it
-   shows up properly in Waybar and app launchers.
+**`omarchy-sync-webapp-icons`** — scans all omarchy `.desktop` files,
+computes the Chrome class name from the URL, and creates a symlink. Also
+scans running `--app` windows for any ad-hoc apps (non-omarchy) and creates
+desktop entries with downloaded favicons.
+
+**`omarchy-watch-webapp-icons`** — uses `inotifywait` to detect new
+`.desktop` files and runs the sync script automatically.
 
 ## Usage
 
 ```bash
-# Deploy (make executable first if needed)
+# Deploy sync and watcher scripts, enable run on Hyprland start
 chmod +x deploy.sh
 ./deploy.sh
 
-# Or copy manually
-cp omarchy-sync-webapp-icons ~/.config/omarchy/bin/
-chmod +x ~/.config/omarchy/hooks/omarchy-sync-webapp-icons
+# Run once
+~/.local/bin/omarchy-sync-webapp-icons
 
-# Run
-~/.config/omarchy/hooks/omarchy-sync-webapp-icons
+# Start watcher immediatedly
+hyprctl dispatch exec ~/.local/bin/omarchy-watch-webapp-icons
 ```
 
-Run whenever you open new web apps (or after an `omarchy refresh`). The
-script is idempotent — re-running is safe.
-
-## Future
-
-Once subscribed to Hyprland's `openwindow` event (`hyprctl events`), this
-script will also trigger automatically by placing it at
-`~/.config/omarchy/hooks/post-boot.d/` or wiring it into a window event
-listener. The `hooks/` directory is the natural home for this.
+After deployment, the watcher starts automatically with Hyprland. 
 
 ## How It Works
 
@@ -70,4 +60,5 @@ Chrome encodes the URL in the window class following this pattern:
 - Prefixed with `chrome-` (or `brave-`, `msedge-`, etc.), suffixed with
   `-Default`
 
-The script reverses this encoding to recover the original URL.
+The sync script runs this encoding in reverse (URL → class) to create
+symlinks, and in forward (class → URL) for ad-hoc windows.

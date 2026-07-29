@@ -1,0 +1,33 @@
+#!/bin/bash
+# Watch for new .desktop files being created and sync web app icons.
+#
+# Uses inotify to detect when new desktop entries are added to
+# ~/.local/share/applications/, then runs omarchy-sync-webapp-icons
+# to create the corresponding Chrome-class symlinks.
+#
+# Start once from Hyprland autostart:
+#   exec-once = ~/.local/bin/omarchy-watch-webapp-icons
+
+set -euo pipefail
+
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+SYNC_SCRIPT="${SCRIPT_DIR}/omarchy-sync-webapp-icons"
+
+# Run once at startup to catch everything
+if [ -f "$SYNC_SCRIPT" ]; then
+    "$SYNC_SCRIPT"
+else
+    omarchy-sync-webapp-icons 2>/dev/null || true
+fi
+
+# Watch for new .desktop files
+WATCH_DIR="${HOME}/.local/share/applications"
+
+while inotifywait -q -e create,moved_to,modify "$WATCH_DIR"; do
+    sleep 1
+    if [ -f "$SYNC_SCRIPT" ]; then
+        "$SYNC_SCRIPT"
+    else
+        omarchy-sync-webapp-icons 2>/dev/null || true
+    fi
+done

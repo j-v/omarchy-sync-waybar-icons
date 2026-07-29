@@ -6,13 +6,10 @@
 #   chrome-<domain>__<path_segments>-Default
 # (first path slash -> __, subsequent slashes -> _)
 #
-# For each matching window:
-#   1. Decodes the URL from the window class
-#   2. If an omarchy-managed .desktop exists for that URL -> symlinks it
-#   3. If not -> downloads the favicon and creates a new .desktop entry
-#
-# TODO: Subscribe to Hyprland 'openwindow' events via `hyprctl events`
-#       and call this automatically instead of requiring manual runs.
+# Phase 1: Scans ALL .desktop files for omarchy web apps and creates symlinks
+#          from the Chrome class name to the existing desktop entry.
+# Phase 2: Scans running --app windows and creates .desktop entries with
+#          favicons for any non-omarchy apps found running.
 
 set -euo pipefail
 
@@ -20,10 +17,63 @@ APP_DIR="${HOME}/.local/share/applications"
 ICON_DIR="${APP_DIR}/icons"
 mkdir -p "${ICON_DIR}"
 
-# Browser class prefixes to match --app windows
 BROWSER_PREFIXES=("chrome-" "brave-" "msedge-" "opera-" "vivaldi-" "helium-")
 
-# Build jq filter for matching browser app windows
+encode_url_to_class() {
+    local url="$1"
+    local stripped="${url#https://}"
+    stripped="${stripped#http://}"
+    local domain="${stripped%%/*}"
+    local path="${stripped#*/}"
+    if [ "$path" = "$stripped" ]; then
+        echo "chrome-${domain}-Default"
+    else
+        path="${path//\//_}"
+        echo "chrome-${domain}__${path}-Default"
+    fi
+}
+
+synced=0
+created=0
+skipped=0
+
+# === Phase 1: Scan all .desktop files for omarchy web apps ===
+for desktop in "${APP_DIR}"/*.desktop; do
+    [ -f "$desktop" ] && [ ! -L "$desktop" ] || continue
+    URL=$(grep "^Exec=omarchy-launch-webapp " "$desktop" | sed 's/^Exec=omarchy-launch-webapp //') || true
+    [ -z "$URL" ] && continue
+
+    CLASS=$(encode_url_to_class "$URL")
+    SHADOW="${APP_DIR}/${CLASS}.desktop"
+
+    # Check if shadow file already exists and is up to date
+    if [ -f "$SHADOW" ]; then
+        # Update if pointing at a different icon (e.g. omarchy updated the icon)
+        CURRENT_TARGET=$(grep "^X-Omarchy-Source=" "$SHADOW" 2>/dev/null | cut -d= -f2-)
+        if [ "$CURRENT_TARGET" = "$desktop" ]; then
+            skipped=$((skipped + 1))
+            continue
+        fi
+        rm -f "$SHADOW"
+    fi
+
+    ICON=$(grep "^Icon=" "$desktop" | head -1 | cut -d= -f2-)
+    APP_NAME=$(grep "^Name=" "$desktop" | head -1 | cut -d= -f2-)
+
+    cat > "$SHADOW" << SHADOW_EOF
+[Desktop Entry]
+Type=Application
+NoDisplay=true
+Name=${APP_NAME}
+Icon=${ICON}
+X-Omarchy-Source=${desktop}
+SHADOW_EOF
+
+    echo "  shadow ${CLASS}.desktop -> $(basename "$desktop")"
+    synced=$((synced + 1))
+done
+
+# === Phase 2: Scan running windows for ad-hoc --app windows ===
 JQ_PREFIXES=""
 for p in "${BROWSER_PREFIXES[@]}"; do
     JQ_PREFIXES+="${p}|"
@@ -31,35 +81,21 @@ done
 JQ_PREFIXES="${JQ_PREFIXES%|}"
 JQ_FILTER='.[] | select(.class | test("^('${JQ_PREFIXES}').+-Default$")) | {class: .class, title: .title} | @json'
 
-synced=0
-created=0
-skipped=0
-
 while IFS= read -r LINE; do
     [ -z "$LINE" ] && continue
 
-    CLASS=$(echo "$LINE"   | jq -r '.class')
-    TITLE=$(echo "$LINE"   | jq -r '.title')
+    CLASS=$(echo "$LINE" | jq -r '.class')
+    TITLE=$(echo "$LINE" | jq -r '.title')
 
-    # Skip if .desktop entry already exists for this class
-    if [ -f "${APP_DIR}/${CLASS}.desktop" ]; then
-        skipped=$((skipped + 1))
-        continue
-    fi
+    # Already handled in Phase 1 or previous run
+    [ -f "${APP_DIR}/${CLASS}.desktop" ] && { skipped=$((skipped + 1)); continue; }
 
-    # Decode URL from window class.
-    # Strip browser prefix (e.g. "chrome-").
     ENCODED="$CLASS"
     for p in "${BROWSER_PREFIXES[@]}"; do
         ENCODED="${ENCODED#"$p"}"
     done
-    # Strip "-Default" suffix.
     ENCODED="${ENCODED%-Default}"
 
-    # Decode: first __  -> /,  remaining _ -> /
-    # NOTE: assumes no literal underscores in URL paths.
-    # If a segment contains '_' it will be miscoded as '/'.
-    # This is a known limitation of the heuristic format.
     if [[ "$ENCODED" == *__* ]]; then
         URL="https://${ENCODED/__/\/}"
         URL="${URL//_/\/}"
@@ -67,38 +103,21 @@ while IFS= read -r LINE; do
         URL="https://${ENCODED}"
     fi
 
-    # Extract domain for favicon (everything before first __ or _).
     DOMAIN=$(echo "$ENCODED" | sed 's|__.*||; s|_.*||')
 
-    # Is there an omarchy-managed .desktop for this URL?
-    MATCHING=""
-    for desktop in "${APP_DIR}"/*.desktop; do
-        [ -f "$desktop" ] || continue
-        if grep -qF "Exec=omarchy-launch-webapp ${URL}" "$desktop" 2>/dev/null; then
-            MATCHING="$desktop"
-            break
-        fi
-    done
+    echo "  create ${CLASS}.desktop (${DOMAIN})"
 
-    if [ -n "$MATCHING" ]; then
-        ln -sf "$MATCHING" "${APP_DIR}/${CLASS}.desktop"
-        echo "  symlink ${CLASS}.desktop -> $(basename "$MATCHING")"
-        synced=$((synced + 1))
-    else
-        echo "  create ${CLASS}.desktop (${DOMAIN})"
+    ICON_PATH="${ICON_DIR}/${CLASS}.png"
+    if [ ! -f "$ICON_PATH" ]; then
+        curl -fsSL --connect-timeout 5 --max-time 10 \
+            -o "$ICON_PATH" \
+            "https://www.google.com/s2/favicons?domain=${DOMAIN}&sz=128" 2>/dev/null || true
+    fi
 
-        ICON_PATH="${ICON_DIR}/${CLASS}.png"
-        if [ ! -f "$ICON_PATH" ]; then
-            curl -fsSL --connect-timeout 5 --max-time 10 \
-                -o "$ICON_PATH" \
-                "https://www.google.com/s2/favicons?domain=${DOMAIN}&sz=128" 2>/dev/null || true
-        fi
+    APP_NAME=$(echo "$TITLE" | sed 's/^([0-9]*) //')
+    [ -z "$APP_NAME" ] && APP_NAME="$DOMAIN"
 
-        # Strip pid prefix like "(5183)" from window title
-        APP_NAME=$(echo "$TITLE" | sed 's/^([0-9]*) //')
-        [ -z "$APP_NAME" ] && APP_NAME="$DOMAIN"
-
-        cat > "${APP_DIR}/${CLASS}.desktop" << DESKTOP_EOF
+    cat > "${APP_DIR}/${CLASS}.desktop" << DESKTOP_EOF
 [Desktop Entry]
 Version=1.0
 Name=${APP_NAME}
@@ -110,11 +129,9 @@ Icon=${ICON_PATH}
 StartupNotify=true
 DESKTOP_EOF
 
-        created=$((created + 1))
-    fi
+    created=$((created + 1))
 done < <(hyprctl clients -j 2>/dev/null | jq -r "$JQ_FILTER")
 
-# Refresh desktop database so app launchers see new entries
 if command -v update-desktop-database &>/dev/null; then
     update-desktop-database "${APP_DIR}" &>/dev/null || true
 fi
