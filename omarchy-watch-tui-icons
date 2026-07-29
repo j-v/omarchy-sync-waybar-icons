@@ -1,0 +1,41 @@
+#!/bin/bash
+# Watch for changes that affect TUI app icons and sync.
+#
+# Uses inotify (monitor mode) to watch ~/.local/share/applications/ for
+# changes, then runs omarchy-sync-tui-icons to update shadow entries.
+#
+# Start once from Hyprland autostart:
+#   exec-once = ~/.local/bin/omarchy-watch-tui-icons
+
+set -euo pipefail
+
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+SYNC_SCRIPT="${SCRIPT_DIR}/omarchy-sync-tui-icons"
+
+WATCH_DIR="${HOME}/.local/share/applications"
+
+# Run once at startup to catch everything
+if [ -f "$SYNC_SCRIPT" ]; then
+    "$SYNC_SCRIPT"
+else
+    omarchy-sync-tui-icons 2>/dev/null || true
+fi
+
+# Watch continuously with monitor mode for reliable event capture
+# Exits if the watch directory is removed (unlikely for ~/.local/share/applications)
+inotifywait -m -q -e create,moved_to,modify,delete --format '%e %f' "$WATCH_DIR" 2>/dev/null | while read -r event file; do
+    # Only react to .desktop file changes
+    case "$file" in
+        *.desktop) ;;
+        *) continue ;;
+    esac
+
+    # Brief debounce — let file writes settle
+    sleep 1
+
+    if [ -f "$SYNC_SCRIPT" ]; then
+        "$SYNC_SCRIPT"
+    else
+        omarchy-sync-tui-icons 2>/dev/null || true
+    fi
+done

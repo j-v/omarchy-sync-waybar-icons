@@ -1,0 +1,281 @@
+#!/bin/bash
+# Sync .desktop entries for TUI (terminal UI) apps so Waybar's taskbar shows
+# correct app icons instead of the generic terminal icon.
+#
+# TUI apps launched via omarchy-launch-tui get window class org.omarchy.<cmd>
+# TUI apps installed via omarchy-tui-install (or custom) often use shared
+# classes TUI.float / TUI.tile, making per-app icon matching impossible.
+#
+# Phase 1: Patch installed TUI .desktop files that use shared classes
+#          (TUI.float / TUI.tile) to use unique per-app app IDs.
+# Phase 2: Create local .desktop overrides for system TUI apps (Terminal=true)
+#          that wrap them with omarchy-launch-tui for a unique window class.
+# Phase 3: Create shadow .desktop entries matching each TUI app's window
+#          class to its correct icon, so Waybar's workspace-taskbar can
+#          resolve the icon.
+
+set -euo pipefail
+
+APP_DIR="${HOME}/.local/share/applications"
+ICON_DIR="${APP_DIR}/icons"
+mkdir -p "${ICON_DIR}"
+
+synced=0
+patched=0
+overridden=0
+
+# Sanitize a name for use as a D-Bus well-known name element
+sanitize_class() {
+    echo "$1" | sed 's/[^a-zA-Z0-9._-]/_/g'
+}
+
+# Look up a .desktop file that Exec references the given command
+# Returns "icon|name" or empty
+lookup_desktop_for_cmd() {
+    local cmd="$1"
+    local cmd_base
+    cmd_base=$(basename "$cmd")
+    for df in "${APP_DIR}"/*.desktop; do
+        [ -f "$df" ] || continue
+        if grep -qE "^Exec=.*[ -]${cmd_base}(\"'\"| |\$)" "$df" 2>/dev/null; then
+            local icon name
+            icon=$(grep "^Icon=" "$df" | head -1 | cut -d= -f2-)
+            name=$(grep "^Name=" "$df" | head -1 | cut -d= -f2-)
+            echo "${icon}|${name}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# === Phase 1: Patch shared-class TUI desktop files ===
+for desktop in "${APP_DIR}"/*.desktop; do
+    [ -f "$desktop" ] || continue
+    BASENAME=$(basename "$desktop" .desktop)
+
+    grep -q "^X-Omarchy-TUI-Style=" "$desktop" 2>/dev/null && continue
+
+    CURRENT_EXEC=$(grep "^Exec=" "$desktop" | head -1) || true
+    [ -z "$CURRENT_EXEC" ] && continue
+
+    STYLE=""
+    if echo "$CURRENT_EXEC" | grep -q -- "--app-id=TUI.float"; then
+        STYLE="float"
+    elif echo "$CURRENT_EXEC" | grep -q -- "--app-id=TUI.tile"; then
+        STYLE="tile"
+    else
+        continue
+    fi
+
+    APP_NAME=$(grep "^Name=" "$desktop" | head -1 | cut -d= -f2-)
+    [ -z "$APP_NAME" ] && APP_NAME="$BASENAME"
+
+    SANE_NAME=$(sanitize_class "$APP_NAME")
+    NEW_CLASS="org.omarchy.tui.${STYLE}.${SANE_NAME}"
+
+    # Strip the Exec= prefix before transforming
+    CURRENT_EXEC_VAL=${CURRENT_EXEC#Exec=}
+    NEW_EXEC_VAL=$(echo "$CURRENT_EXEC_VAL" | sed "s/--app-id=TUI\\.${STYLE}/--app-id=${NEW_CLASS}/")
+
+    sed -i '/^StartupWMClass=/d' "$desktop"
+    sed -i "s|^Exec=.*|Exec=${NEW_EXEC_VAL}|" "$desktop"
+
+    printf '\nStartupWMClass=%s\nX-Omarchy-TUI-Style=%s\n' "${NEW_CLASS}" "${STYLE}" >> "$desktop"
+
+    echo "  patch ${BASENAME}.desktop -> class ${NEW_CLASS}"
+    patched=$((patched + 1))
+done
+
+# === Phase 2: Create local overrides for system TUI apps ===
+# System TUI apps (installed via pacman) have .desktop files with Terminal=true.
+# When launched from Walker, the app runs inside a terminal and the window class
+# is the terminal's — so Waybar shows a terminal icon regardless of which TUI
+# app is running.
+#
+# To fix this, we create local .desktop overrides in ~/.local/share/applications/
+# that wrap the app with omarchy-launch-tui, giving it a unique window class.
+system_dirs=("/usr/share/applications" "/usr/local/share/applications")
+
+KNOWN_TUI_APPS=("micro" "cliamp" "btop" "nvim" "htop")
+
+for app_id in "${KNOWN_TUI_APPS[@]}"; do
+    command -v "$app_id" &>/dev/null || continue
+
+    sys_desktop=""
+    for dir in "${system_dirs[@]}"; do
+        if [ -f "${dir}/${app_id}.desktop" ]; then
+            sys_desktop="${dir}/${app_id}.desktop"
+            break
+        fi
+    done
+    [ -z "$sys_desktop" ] && continue
+
+    grep -q "^Terminal=true" "$sys_desktop" || continue
+
+    local_desktop="${APP_DIR}/${app_id}.desktop"
+    if [ -f "$local_desktop" ]; then
+        grep -q "^X-Omarchy-TUI-Override=true" "$local_desktop" 2>/dev/null && continue
+    fi
+
+    APP_NAME=$(grep "^Name=" "$sys_desktop" | head -1 | cut -d= -f2- || true)
+    APP_ICON=$(grep "^Icon=" "$sys_desktop" | head -1 | cut -d= -f2- || true)
+    APP_COMMENT=$(grep "^Comment=" "$sys_desktop" | head -1 | cut -d= -f2- || true)
+    APP_GENERICNAME=$(grep "^GenericName=" "$sys_desktop" | head -1 | cut -d= -f2- || true)
+    APP_CATEGORIES=$(grep "^Categories=" "$sys_desktop" | head -1 | cut -d= -f2- || true)
+    APP_KEYWORDS=$(grep "^Keywords=" "$sys_desktop" | head -1 | cut -d= -f2- || true)
+    APP_MIMETYPE=$(grep "^MimeType=" "$sys_desktop" | head -1 | cut -d= -f2- || true)
+
+    ORIG_EXEC=$(grep "^Exec=" "$sys_desktop" | head -1 | cut -d= -f2- || true)
+    ORIG_ARGS=""
+    if echo "$ORIG_EXEC" | grep -q ' '; then
+        ORIG_ARGS=$(echo "$ORIG_EXEC" | cut -d' ' -f2-)
+    fi
+
+    NEW_CLASS="org.omarchy.${app_id}"
+
+    {
+        echo "[Desktop Entry]"
+        echo "Type=Application"
+        [ -n "$APP_NAME" ] && echo "Name=${APP_NAME}"
+        [ -n "$APP_GENERICNAME" ] && echo "GenericName=${APP_GENERICNAME}"
+        [ -n "$APP_COMMENT" ] && echo "Comment=${APP_COMMENT}"
+        echo "Exec=omarchy-launch-tui ${app_id}${ORIG_ARGS:+ ${ORIG_ARGS}}"
+        echo "Icon=${APP_ICON:-${app_id}}"
+        [ -n "$APP_CATEGORIES" ] && echo "Categories=${APP_CATEGORIES}"
+        [ -n "$APP_KEYWORDS" ] && echo "Keywords=${APP_KEYWORDS}"
+        [ -n "$APP_MIMETYPE" ] && echo "MimeType=${APP_MIMETYPE}"
+        echo "Terminal=false"
+        echo "StartupNotify=false"
+        echo "StartupWMClass=${NEW_CLASS}"
+        echo "X-Omarchy-TUI-Override=true"
+    } > "$local_desktop"
+
+    echo "  override ${app_id}.desktop -> class ${NEW_CLASS}"
+    overridden=$((overridden + 1))
+done
+
+# === Phase 3: Discover TUI apps and create shadow entries ===
+#
+# Use a temp file to collect entries for dedup. Each line: CLASS|ICON|NAME
+tmpfile=$(mktemp /tmp/omarchy-tui-entries.XXXXXX)
+trap 'rm -f "$tmpfile"' EXIT
+
+# Record an entry (first source wins)
+record_entry() {
+    local class="$1" icon="$2" name="$3"
+    [ -z "$class" ] && return
+    grep -q "^${class}|" "$tmpfile" 2>/dev/null && return
+    printf '%s|%s|%s\n' "$class" "$icon" "$name" >> "$tmpfile"
+}
+
+# First, record entries for any overrides we just created (Phase 2)
+for app_id in "${KNOWN_TUI_APPS[@]}"; do
+    local_desktop="${APP_DIR}/${app_id}.desktop"
+    [ -f "$local_desktop" ] || continue
+    grep -q "^X-Omarchy-TUI-Override=true" "$local_desktop" 2>/dev/null || continue
+
+    CLASS="org.omarchy.${app_id}"
+    ICON=$(grep "^Icon=" "$local_desktop" | head -1 | cut -d= -f2-)
+    APP_NAME=$(grep "^Name=" "$local_desktop" | head -1 | cut -d= -f2-)
+    record_entry "$CLASS" "$ICON" "$APP_NAME"
+done
+
+# --- Source A: Desktop files with omarchy-launch-tui ---
+for desktop in "${APP_DIR}"/*.desktop; do
+    [ -f "$desktop" ] && [ ! -L "$desktop" ] || continue
+    EXEC=$(grep "^Exec=" "$desktop" | head -1) || true
+    [ -z "$EXEC" ] && continue
+
+    CMD=$(echo "$EXEC" | sed -n 's/^Exec=omarchy-launch-tui //p; s/^Exec=omarchy-launch-or-focus-tui //p') || true
+    [ -z "$CMD" ] && continue
+
+    CMD_NAME=$(echo "$CMD" | awk '{print $1}')
+    [ -z "$CMD_NAME" ] && continue
+
+    CLASS="org.omarchy.$(basename "$CMD_NAME")"
+    ICON=$(grep "^Icon=" "$desktop" | head -1 | cut -d= -f2-)
+    APP_NAME=$(grep "^Name=" "$desktop" | head -1 | cut -d= -f2-)
+    [ -z "$APP_NAME" ] && APP_NAME="$CMD_NAME"
+
+    record_entry "$CLASS" "$ICON" "$APP_NAME"
+done
+
+# --- Source B: Desktop files with --app-id=org.omarchy.tui.* (Phase 1 patched) ---
+for desktop in "${APP_DIR}"/*.desktop; do
+    [ -f "$desktop" ] && [ ! -L "$desktop" ] || continue
+    EXEC=$(grep "^Exec=" "$desktop" | head -1) || true
+    [ -z "$EXEC" ] && continue
+
+    APP_ID=$(echo "$EXEC" | sed -n 's/.*--app-id=\(org\.omarchy\.tui\.[^ ]*\).*/\1/p') || true
+    [ -z "$APP_ID" ] && continue
+
+    ICON=$(grep "^Icon=" "$desktop" | head -1 | cut -d= -f2-)
+    APP_NAME=$(grep "^Name=" "$desktop" | head -1 | cut -d= -f2-)
+    [ -z "$APP_NAME" ] && APP_NAME="$APP_ID"
+
+    record_entry "$APP_ID" "$ICON" "$APP_NAME"
+done
+
+# --- Source C: Keybindings with omarchy-launch-tui / omarchy-launch-or-focus-tui ---
+if [ -f "${HOME}/.config/hypr/bindings.conf" ]; then
+    while IFS= read -r line; do
+        CMD=$(echo "$line" | sed -n 's/.*omarchy-launch-tui \([^ ]*\).*/\1/p')
+        [ -z "$CMD" ] && CMD=$(echo "$line" | sed -n 's/.*omarchy-launch-or-focus-tui \([^ ]*\).*/\1/p')
+        [ -z "$CMD" ] && continue
+
+        CMD_BASE=$(basename "$CMD")
+        CLASS="org.omarchy.${CMD_BASE}"
+
+        # Skip if already recorded
+        grep -q "^${CLASS}|" "$tmpfile" 2>/dev/null && continue
+
+        ICON=""
+        APP_NAME="$CMD_BASE"
+
+        # Try to find a desktop file that Exec this command
+        found=$(lookup_desktop_for_cmd "$CMD" 2>/dev/null || true)
+        if [ -n "$found" ]; then
+            ICON="${found%%|*}"
+            FOUND_NAME="${found#*|}"
+            [ -n "$FOUND_NAME" ] && APP_NAME="$FOUND_NAME"
+        fi
+
+        [ -z "$ICON" ] && ICON="$CMD_BASE"
+
+        record_entry "$CLASS" "$ICON" "$APP_NAME"
+    done < "${HOME}/.config/hypr/bindings.conf"
+fi
+
+# --- Create shadow desktop entries ---
+while IFS='|' read -r CLASS ICON APP_NAME; do
+    [ -z "$CLASS" ] && continue
+
+    SHADOW="${APP_DIR}/${CLASS}.desktop"
+
+    if [ -f "$SHADOW" ]; then
+        CURRENT_ICON=$(grep "^Icon=" "$SHADOW" 2>/dev/null | head -1 | cut -d= -f2-)
+        if [ "$CURRENT_ICON" = "$ICON" ]; then
+            continue
+        fi
+        rm -f "$SHADOW"
+    fi
+
+    cat > "$SHADOW" << SHADOW_EOF
+[Desktop Entry]
+Type=Application
+NoDisplay=true
+Name=${APP_NAME}
+Icon=${ICON}
+StartupWMClass=${CLASS}
+X-Omarchy-TUI=true
+SHADOW_EOF
+
+    echo "  shadow ${CLASS}.desktop -> icon=${ICON}"
+    synced=$((synced + 1))
+done < "$tmpfile"
+
+if command -v update-desktop-database &>/dev/null; then
+    update-desktop-database "${APP_DIR}" &>/dev/null || true
+fi
+
+echo "Done: ${patched} patched, ${overridden} overridden, ${synced} synced"
